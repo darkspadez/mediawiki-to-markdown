@@ -12,6 +12,7 @@ import yaml
 import argparse
 import inflect
 import logging
+from urllib.parse import quote as url_quote
 from tqdm import tqdm
 
 p = inflect.engine()
@@ -27,16 +28,41 @@ WIKILINK_REGEX = re.compile(r'\[\[(.*?)\]\]', re.DOTALL)
 PANDOC_LINK_REGEX = re.compile(
     r'\[([^\]]+)\]\(((?:[^\(\)]+|\([^\)]*\))+)(?:\s+"wikilink")?\)'
 )
+# HTML artifact patterns for outline mode
+HTML_BR_REGEX = re.compile(r'<br\s*/?>', re.IGNORECASE)
+HTML_SUP_REGEX = re.compile(r'<sup>(.*?)</sup>', re.IGNORECASE | re.DOTALL)
+HTML_SUB_REGEX = re.compile(r'<sub>(.*?)</sub>', re.IGNORECASE | re.DOTALL)
+HTML_TAG_REGEX = re.compile(r'</?[a-zA-Z][^>]*>')
+# Footnote patterns
+FOOTNOTE_REF_REGEX = re.compile(r'\[\^(\w+)\](?!:)')
+FOOTNOTE_DEF_REGEX = re.compile(r'^\[\^(\w+)\]:\s*(.+)$', re.MULTILINE)
+# Obsidian image embed pattern (escaped or not)
+OBSIDIAN_IMAGE_EMBED_REGEX = re.compile(r'\\?!\[\[([^\]]+)\]\]')
 
 def TAG(t):
     return f"{{{NS}}}{t}"
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Convert MediaWiki XML to Obsidian Vault")
+    parser = argparse.ArgumentParser(
+        description="Convert MediaWiki XML to Markdown (Obsidian or Outline)"
+    )
     parser.add_argument("input_xml", help="Input XML file")
-    parser.add_argument("output_dir", nargs="?", default="obsidian_vault", help="Output directory")
-    parser.add_argument("--skip-redirects", action="store_true", help="Skip redirect pages")
-    parser.add_argument("--verbose", action="store_true", help="Enable verbose logging")
+    parser.add_argument("output_dir", nargs="?", default=None,
+                        help="Output directory (default: obsidian_vault or outline_output)")
+    parser.add_argument("--output-format", choices=["obsidian", "outline"],
+                        default="obsidian",
+                        help="Output format: 'obsidian' (default) or 'outline'")
+    parser.add_argument("--skip-redirects", action="store_true",
+                        help="Skip redirect pages")
+    parser.add_argument("--verbose", action="store_true",
+                        help="Enable verbose logging")
+    # Outline API options
+    parser.add_argument("--outline-url",
+                        help="Outline instance URL (e.g. https://wiki.example.com)")
+    parser.add_argument("--outline-api-key",
+                        help="Outline API key for uploading documents")
+    parser.add_argument("--collection-id",
+                        help="Outline collection ID to import documents into")
     return parser.parse_args()
 
 args = parse_args()
@@ -48,13 +74,19 @@ logging.basicConfig(
 )
 
 INPUT_XML = args.input_xml
-OUTPUT_DIR = args.output_dir
+OUTPUT_FORMAT = args.output_format
+OUTPUT_DIR = args.output_dir or ("outline_output" if OUTPUT_FORMAT == "outline" else "obsidian_vault")
 SKIP_REDIRECTS = args.skip_redirects
+OUTLINE_URL = args.outline_url
+OUTLINE_API_KEY = args.outline_api_key
+COLLECTION_ID = args.collection_id
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 tag_to_pages = defaultdict(list)
 filename_counts = defaultdict(int)
+# Mapping from category -> list of (title, filename) for outline collection organization
+category_to_pages = defaultdict(list)
 
 WIKI_DOMAIN = None
 
@@ -81,16 +113,31 @@ def display_title(title):
     """Convert to human-readable title with spaces"""
     return title.replace('_', ' ')
 
-def clean_wikilink(link_content):
-    """Centralized wikilink cleaning"""
+def clean_wikilink(link_content, output_format=None):
+    """Centralized wikilink cleaning.
+    In obsidian mode: [[Target|Alias]] or [[Target]]
+    In outline mode: [Alias](Target.md) or [Target](Target.md)
+    """
+    fmt = output_format or OUTPUT_FORMAT
     if '|' in link_content:
         target, alias = link_content.split('|', 1)
-        return f"[[{target.replace('_', ' ')}|{alias}]]"
-    return f"[[{link_content.replace('_', ' ')}]]"
+        clean_target = target.replace('_', ' ')
+        if fmt == "outline":
+            filename = clean_filename(target) + ".md"
+            return f"[{alias}](./{url_quote(filename)})"
+        return f"[[{clean_target}|{alias}]]"
+    clean = link_content.replace('_', ' ')
+    if fmt == "outline":
+        filename = clean_filename(link_content) + ".md"
+        return f"[{clean}](./{url_quote(filename)})"
+    return f"[[{clean}]]"
 
-def fix_wikilink_spacing(text):
+def fix_wikilink_spacing(text, output_format=None):
     """Convert underscores to spaces in wikilinks using centralized cleaner"""
-    return WIKILINK_REGEX.sub(lambda m: clean_wikilink(m.group(1)), text)
+    fmt = output_format or OUTPUT_FORMAT
+    return WIKILINK_REGEX.sub(
+        lambda m: clean_wikilink(m.group(1), output_format=fmt), text
+    )
 
 def extract_categories(wikicode):
     categories = []
@@ -102,7 +149,8 @@ def extract_categories(wikicode):
             wikicode.remove(link)
     return wikicode, categories
 
-def extract_images(wikicode):
+def extract_images(wikicode, output_format=None):
+    fmt = output_format or OUTPUT_FORMAT
     images = set()
     nodes = list(wikicode.nodes)  # make a list copy because we'll modify
 
@@ -114,7 +162,10 @@ def extract_images(wikicode):
                 local_filename = download_image(image_name)
 
                 if local_filename:
-                    embed_link = f"![[{IMAGE_DIR}/{local_filename}]]"
+                    if fmt == "outline":
+                        embed_link = f"![{image_name}](./{IMAGE_DIR}/{url_quote(local_filename)})"
+                    else:
+                        embed_link = f"![[{IMAGE_DIR}/{local_filename}]]"
 
                     # Replace the wikilink node in wikicode directly
                     wikicode.replace(node, embed_link)
@@ -174,7 +225,8 @@ def download_image(image_name):
         logging.error(f"❌ Error downloading {image_name}: {e}")
         return None
 
-def extract_infobox(wikicode):
+def extract_infobox(wikicode, output_format=None):
+    fmt = output_format or OUTPUT_FORMAT
     infobox_data = {}
     infobox_template = None
 
@@ -215,11 +267,14 @@ def extract_infobox(wikicode):
 
     wikicode.remove(infobox_template)
 
-    # Extract the image from the infox and inline it at top of markdown
+    # Extract the image from the infobox and inline it at top of markdown
     if image_name := infobox_data.get('image'):
         image_name = image_name.strip()
         download_image(image_name)
-        embed = f"![[{IMAGE_DIR}/{image_name}]]\n\n"
+        if fmt == "outline":
+            embed = f"![{image_name}](./{IMAGE_DIR}/{url_quote(image_name)})\n\n"
+        else:
+            embed = f"![[{IMAGE_DIR}/{image_name}]]\n\n"
         wikicode.insert(0, embed)
 
     return wikicode, infobox_data
@@ -234,7 +289,10 @@ def sanitize_for_yaml(obj):
     else:
         return str(obj)
 
-def extract_yaml_header(title, tags, extra_fields=None):
+def extract_yaml_header(title, tags, extra_fields=None, output_format=None):
+    fmt = output_format or OUTPUT_FORMAT
+    if fmt == "outline":
+        return _extract_outline_header(title, tags, extra_fields)
     header = {
         'title': display_title(title),
         'tags': tags
@@ -244,10 +302,45 @@ def extract_yaml_header(title, tags, extra_fields=None):
 
     return f"---\n{yaml.safe_dump(header, sort_keys=False)}---\n"
 
+
+def _extract_outline_header(title, tags, extra_fields=None):
+    """Generate an Outline-compatible document header.
+    Uses an H1 title and an optional metadata info block.
+    """
+    lines = [f"# {display_title(title)}", ""]
+
+    # Build metadata items
+    meta_items = []
+    if tags:
+        meta_items.append(("Tags", ", ".join(f"`{t}`" for t in tags)))
+    if extra_fields:
+        sanitized = sanitize_for_yaml(extra_fields)
+        for key, val in sanitized.items():
+            if key in ('title', 'tags', 'infobox', 'image'):
+                continue
+            if isinstance(val, list):
+                display_val = ", ".join(str(v) for v in val)
+            else:
+                display_val = str(val)
+            if display_val:
+                meta_items.append((key.replace('_', ' ').title(), display_val))
+
+    if meta_items:
+        lines.append("| Field | Value |")
+        lines.append("|---|---|")
+        for field, value in meta_items:
+            # Escape pipes in values
+            safe_value = value.replace("|", "\\|")
+            lines.append(f"| **{field}** | {safe_value} |")
+        lines.append("")
+
+    return "\n".join(lines) + "\n"
+
 def clean_heading_ids(md_text):
     return HEADING_ID_REGEX.sub(r'\1', md_text)
 
-def extract_links_from_pandoc(md_text):
+def extract_links_from_pandoc(md_text, output_format=None):
+    fmt = output_format or OUTPUT_FORMAT
     def replacer(match):
         text = match.group(1).strip()
         target = match.group(2).replace(' "wikilink"', '').strip()
@@ -256,6 +349,11 @@ def extract_links_from_pandoc(md_text):
             return match.group(0)
 
         clean_target = display_title(target)
+
+        if fmt == "outline":
+            filename = clean_filename(target) + ".md"
+            return f"[{text}](./{url_quote(filename)})"
+
         # Only include alias if it's actually different
         if text == clean_target:
             return f"[[{clean_target}]]"
@@ -266,21 +364,128 @@ def extract_links_from_pandoc(md_text):
 def clean_residual_wikilink_artifacts(md_text):
     return md_text.replace(' "wikilink"', '')
 
-def fix_image_links(md):
+def fix_image_links(md, output_format=None):
+    fmt = output_format or OUTPUT_FORMAT
+    if fmt == "outline":
+        # Convert any remaining Obsidian-style image embeds to standard markdown
+        def _replace_obsidian_embed(m):
+            path = m.group(1)
+            name = path.split("/")[-1] if "/" in path else path
+            return f"![{name}](./{path})"
+        return OBSIDIAN_IMAGE_EMBED_REGEX.sub(_replace_obsidian_embed, md)
     return re.sub(r'\\(!\[\[)', r'\1', md)
 
-def cleanup_markdown(md):
+
+def strip_html_artifacts(md_text):
+    """Strip or convert HTML artifacts that Outline cannot render.
+    - <br> → double newline
+    - <sup>text</sup> → $^{text}$ (LaTeX)
+    - <sub>text</sub> → $_{text}$ (LaTeX)
+    - Remaining HTML tags → stripped
+    """
+    md_text = HTML_BR_REGEX.sub('\n\n', md_text)
+    md_text = HTML_SUP_REGEX.sub(r'$^{\1}$', md_text)
+    md_text = HTML_SUB_REGEX.sub(r'$_{\1}$', md_text)
+    md_text = HTML_TAG_REGEX.sub('', md_text)
+    return md_text
+
+
+def convert_footnotes(md_text):
+    """Convert markdown footnotes to inline parenthetical references
+    and a References section at the bottom. Outline does not support footnotes.
+    """
+    # Collect footnote definitions
+    definitions = {}
+    for match in FOOTNOTE_DEF_REGEX.finditer(md_text):
+        definitions[match.group(1)] = match.group(2).strip()
+
+    if not definitions:
+        return md_text
+
+    # Remove footnote definition lines
+    md_text = FOOTNOTE_DEF_REGEX.sub('', md_text)
+
+    # Replace footnote references with numbered superscripts linking to references
+    counter = [0]
+    ref_map = {}
+
+    def _replace_ref(match):
+        key = match.group(1)
+        if key not in ref_map:
+            counter[0] += 1
+            ref_map[key] = counter[0]
+        num = ref_map[key]
+        return f'$^{{{num}}}$'
+
+    md_text = FOOTNOTE_REF_REGEX.sub(_replace_ref, md_text)
+
+    # Append references section
+    if ref_map:
+        md_text = md_text.rstrip() + "\n\n---\n\n**References**\n\n"
+        for key, num in sorted(ref_map.items(), key=lambda x: x[1]):
+            text = definitions.get(key, "")
+            md_text += f"{num}. {text}\n"
+
+    return md_text
+
+
+def convert_definition_lists(md_text):
+    """Convert definition list syntax to bold-term + indented description.
+    Pandoc may output definition lists as:
+      Term
+      :   Definition
+    Convert to:
+      **Term**
+        Definition
+    """
+    lines = md_text.split('\n')
+    result = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        # Check if next line is a definition (starts with `:   `)
+        if (i + 1 < len(lines) and
+                re.match(r'^:\s{3,}', lines[i + 1]) and
+                line.strip() and
+                not line.startswith('#') and
+                not line.startswith('|') and
+                not line.startswith('-') and
+                not line.startswith('>')):
+            # This line is a term
+            result.append(f"**{line.strip()}**")
+            i += 1
+            # Collect all following definition lines
+            while i < len(lines) and re.match(r'^:\s{3,}', lines[i]):
+                defn = re.sub(r'^:\s{3,}', '', lines[i])
+                result.append(f"  {defn}")
+                i += 1
+        else:
+            result.append(line)
+            i += 1
+    return '\n'.join(result)
+
+def cleanup_markdown(md, output_format=None):
+    fmt = output_format or OUTPUT_FORMAT
     md = clean_heading_ids(md)
-    md = extract_links_from_pandoc(md)
+    md = extract_links_from_pandoc(md, output_format=fmt)
     md = clean_residual_wikilink_artifacts(md)
-    md = fix_wikilink_spacing(md)
-    md = fix_image_links(md)
+    md = fix_wikilink_spacing(md, output_format=fmt)
+    md = fix_image_links(md, output_format=fmt)
+    if fmt == "outline":
+        md = strip_html_artifacts(md)
+        md = convert_footnotes(md)
+        md = convert_definition_lists(md)
     return md
 
-def convert_with_pandoc(text, title=""):
+def convert_with_pandoc(text, title="", output_format=None):
+    fmt = output_format or OUTPUT_FORMAT
+    if fmt == "outline":
+        pandoc_to = 'markdown_strict+pipe_tables+backtick_code_blocks+fenced_code_blocks+strikeout+task_lists'
+    else:
+        pandoc_to = 'markdown'
     try:
         result = subprocess.run(
-            ['pandoc', '--from=mediawiki', '--to=markdown', '--wrap=none'],
+            ['pandoc', '--from=mediawiki', f'--to={pandoc_to}', '--wrap=none'],
             input=text.encode("utf-8"),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -294,12 +499,13 @@ def convert_with_pandoc(text, title=""):
         logging.debug(e.stderr.decode())
         return text
 
-def clean_and_convert_text(raw_text, title):
+def clean_and_convert_text(raw_text, title, output_format=None):
+    fmt = output_format or OUTPUT_FORMAT
     text = unescape(raw_text)
     wikicode = mwparserfromhell.parse(text)
     wikicode, tags = extract_categories(wikicode)
-    wikicode = extract_images(wikicode)
-    wikicode, infobox_data = extract_infobox(wikicode)
+    wikicode = extract_images(wikicode, output_format=fmt)
+    wikicode, infobox_data = extract_infobox(wikicode, output_format=fmt)
 
     # Conditionally infer tag
     if infobox_data.get('infobox'):
@@ -314,13 +520,13 @@ def clean_and_convert_text(raw_text, title):
             tags.append(inferred_tag)
 
     cleaned_text = str(wikicode).strip()
-    yaml_header = extract_yaml_header(title, tags, infobox_data)
+    header = extract_yaml_header(title, tags, infobox_data, output_format=fmt)
 
     # Track tags for index
     for tag in tags:
         tag_to_pages[tag].append(title)
 
-    return yaml_header, cleaned_text, tags
+    return header, cleaned_text, tags
 
 def convert_pages(tree):
     ns = {"ns": NS}
@@ -356,15 +562,26 @@ def convert_pages(tree):
                 continue
 
             raw_text = text_elem.text
-            yaml_str, wikitext, tags = clean_and_convert_text(raw_text, title)
+            header_str, wikitext, tags = clean_and_convert_text(raw_text, title)
             wikitext = convert_with_pandoc(wikitext, title)
             wikitext = cleanup_markdown(wikitext)
-            markdown = f"{yaml_str}\n{wikitext.strip()}\n"
+            markdown = f"{header_str}\n{wikitext.strip()}\n"
             base_filename = clean_filename(title)
             count = filename_counts[base_filename]
             filename_counts[base_filename] += 1
             filename = f"{base_filename}{'_' + str(count) if count else ''}.md"
-            filepath = os.path.join(OUTPUT_DIR, filename)
+
+            if OUTPUT_FORMAT == "outline" and tags:
+                # Place in subdirectory for primary category (first tag)
+                primary_cat = tags[0]
+                cat_dir = os.path.join(OUTPUT_DIR, clean_filename(primary_cat))
+                os.makedirs(cat_dir, exist_ok=True)
+                filepath = os.path.join(cat_dir, filename)
+                # Track for collection mapping
+                for tag in tags:
+                    category_to_pages[tag].append((title, filename))
+            else:
+                filepath = os.path.join(OUTPUT_DIR, filename)
 
             with open(filepath, "w", encoding="utf-8") as f:
                 logging.debug(f"✍️ Writing: {filepath}")
@@ -375,6 +592,9 @@ def convert_pages(tree):
     logging.info("✅ Main articles converted")
 
 def create_tag_indexes():
+    if OUTPUT_FORMAT == "outline":
+        _create_outline_collection_indexes()
+        return
     index_dir = os.path.join(OUTPUT_DIR, "_indexes")
     os.makedirs(index_dir, exist_ok=True)
     for tag, pages in tag_to_pages.items():
@@ -389,8 +609,174 @@ def create_tag_indexes():
             f.write(content)
     logging.info("📚 Index pages created under _indexes/ with tag references")
 
+
+def _create_outline_collection_indexes():
+    """Create collection index documents for Outline mode.
+    Each category gets an index page with standard markdown links to its documents.
+    """
+    for tag, pages in tag_to_pages.items():
+        display_tag = display_title(tag)
+        cat_dir = os.path.join(OUTPUT_DIR, clean_filename(tag))
+        os.makedirs(cat_dir, exist_ok=True)
+
+        lines = [f"# {display_tag.title()}", ""]
+        for page in sorted(pages):
+            display_page = display_title(page)
+            filename = clean_filename(page) + ".md"
+            lines.append(f"- [{display_page}](./{url_quote(filename)})")
+
+        content = "\n".join(lines) + "\n"
+        index_path = os.path.join(cat_dir, "index.md")
+        with open(index_path, "w", encoding="utf-8") as f:
+            f.write(content)
+
+    logging.info("📚 Collection index pages created for Outline")
+
+def outline_api_request(endpoint, data=None, files=None):
+    """Make an authenticated request to the Outline API."""
+    if not OUTLINE_URL or not OUTLINE_API_KEY:
+        return None
+    url = f"{OUTLINE_URL.rstrip('/')}/api/{endpoint}"
+    headers = {"Authorization": f"Bearer {OUTLINE_API_KEY}"}
+    try:
+        if files:
+            resp = requests.post(url, headers=headers, data=data, files=files, timeout=30)
+        else:
+            headers["Content-Type"] = "application/json"
+            resp = requests.post(url, headers=headers, json=data, timeout=30)
+        resp.raise_for_status()
+        return resp.json()
+    except requests.RequestException as e:
+        logging.error(f"❌ Outline API error ({endpoint}): {e}")
+        return None
+
+
+def outline_get_or_create_collection(name):
+    """Get an existing collection by name or create a new one."""
+    # List existing collections
+    result = outline_api_request("collections.list", {"limit": 100})
+    if result and result.get("data"):
+        for col in result["data"]:
+            if col.get("name", "").lower() == name.lower():
+                logging.debug(f"📂 Found existing collection: {name}")
+                return col["id"]
+
+    # Create new collection
+    result = outline_api_request("collections.create", {
+        "name": name,
+        "permission": "read_write"
+    })
+    if result and result.get("data"):
+        logging.info(f"📂 Created collection: {name}")
+        return result["data"]["id"]
+    return None
+
+
+def outline_upload_image(filepath):
+    """Upload an image to Outline and return its URL."""
+    filename = os.path.basename(filepath)
+    content_type = "image/png"
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    ct_map = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "gif": "image/gif",
+              "svg": "image/svg+xml", "webp": "image/webp"}
+    content_type = ct_map.get(ext, content_type)
+
+    try:
+        with open(filepath, "rb") as f:
+            result = outline_api_request(
+                "attachments.create",
+                data={"name": filename, "documentId": ""},
+                files={"file": (filename, f, content_type)}
+            )
+        if result and result.get("data"):
+            return result["data"].get("url")
+    except Exception as e:
+        logging.error(f"❌ Failed to upload image {filename}: {e}")
+    return None
+
+
+def outline_upload_documents():
+    """Upload all converted documents to Outline via API."""
+    if not OUTLINE_URL or not OUTLINE_API_KEY:
+        return
+
+    logging.info("📤 Uploading documents to Outline...")
+
+    # Upload images first and build URL mapping
+    image_url_map = {}
+    images_dir = os.path.join(OUTPUT_DIR, IMAGE_DIR)
+    if os.path.isdir(images_dir):
+        for img_file in os.listdir(images_dir):
+            img_path = os.path.join(images_dir, img_file)
+            if os.path.isfile(img_path):
+                url = outline_upload_image(img_path)
+                if url:
+                    image_url_map[img_file] = url
+                    logging.debug(f"📤 Uploaded image: {img_file}")
+
+    # Determine collection IDs
+    collection_ids = {}
+    if COLLECTION_ID:
+        default_collection = COLLECTION_ID
+    else:
+        default_collection = outline_get_or_create_collection("Imported Wiki")
+
+    if not default_collection:
+        logging.error("❌ Could not get or create Outline collection")
+        return
+
+    # Walk through output directory and upload documents
+    uploaded = 0
+    for root, dirs, files in os.walk(OUTPUT_DIR):
+        for fname in files:
+            if not fname.endswith(".md"):
+                continue
+            fpath = os.path.join(root, fname)
+            with open(fpath, "r", encoding="utf-8") as f:
+                content = f.read()
+
+            # Rewrite image URLs to use Outline attachment URLs
+            for img_name, img_url in image_url_map.items():
+                content = content.replace(
+                    f"./{IMAGE_DIR}/{url_quote(img_name)}", img_url
+                )
+                content = content.replace(
+                    f"./{IMAGE_DIR}/{img_name}", img_url
+                )
+
+            # Extract title from first H1 heading
+            title_match = re.match(r'^# (.+)$', content, re.MULTILINE)
+            title = title_match.group(1) if title_match else fname.replace(".md", "").replace("_", " ")
+
+            # Determine collection
+            rel_dir = os.path.relpath(root, OUTPUT_DIR)
+            if rel_dir != "." and rel_dir != IMAGE_DIR:
+                cat_name = display_title(rel_dir)
+                if cat_name not in collection_ids:
+                    cid = outline_get_or_create_collection(cat_name)
+                    collection_ids[cat_name] = cid or default_collection
+                col_id = collection_ids[cat_name]
+            else:
+                col_id = default_collection
+
+            result = outline_api_request("documents.create", {
+                "title": title,
+                "text": content,
+                "collectionId": col_id,
+                "publish": True,
+            })
+            if result and result.get("data"):
+                uploaded += 1
+                logging.debug(f"📤 Uploaded: {title}")
+            else:
+                logging.warning(f"⚠️ Failed to upload: {title}")
+
+    logging.info(f"📤 Uploaded {uploaded} documents to Outline")
+
+
 def main():
-    logging.info("🔄 Converting MediaWiki XML to Obsidian Vault...")
+    fmt_label = "Outline" if OUTPUT_FORMAT == "outline" else "Obsidian Vault"
+    logging.info(f"🔄 Converting MediaWiki XML to {fmt_label}...")
     try:
         tree = ET.parse(INPUT_XML)
     except ET.ParseError as e:
@@ -405,7 +791,11 @@ def main():
 
     convert_pages(tree)
     create_tag_indexes()
-    logging.info(f"✅ All done! Markdown vault ready at: {OUTPUT_DIR}")
+
+    if OUTPUT_FORMAT == "outline" and OUTLINE_URL and OUTLINE_API_KEY:
+        outline_upload_documents()
+
+    logging.info(f"✅ All done! Markdown ready at: {OUTPUT_DIR}")
 
 if __name__ == "__main__":
     main()
