@@ -38,6 +38,11 @@ FOOTNOTE_REF_REGEX = re.compile(r'\[\^(\w+)\](?!:)')
 FOOTNOTE_DEF_REGEX = re.compile(r'^\[\^(\w+)\]:\s*(.+)$', re.MULTILINE)
 # Obsidian image embed pattern (escaped or not)
 OBSIDIAN_IMAGE_EMBED_REGEX = re.compile(r'\\?!\[\[([^\]]+)\]\]')
+# Image content type mapping
+IMAGE_CONTENT_TYPES = {
+    "jpg": "image/jpeg", "jpeg": "image/jpeg", "gif": "image/gif",
+    "png": "image/png", "svg": "image/svg+xml", "webp": "image/webp",
+}
 
 def TAG(t):
     return f"{{{NS}}}{t}"
@@ -675,11 +680,8 @@ def outline_get_or_create_collection(name):
 def outline_upload_image(filepath):
     """Upload an image to Outline and return its URL."""
     filename = os.path.basename(filepath)
-    content_type = "image/png"
     ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
-    ct_map = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "gif": "image/gif",
-              "svg": "image/svg+xml", "webp": "image/webp"}
-    content_type = ct_map.get(ext, content_type)
+    content_type = IMAGE_CONTENT_TYPES.get(ext, "image/png")
 
     try:
         with open(filepath, "rb") as f:
@@ -745,7 +747,7 @@ def outline_upload_documents():
                 )
 
             # Extract title from first H1 heading
-            title_match = re.match(r'^# (.+)$', content, re.MULTILINE)
+            title_match = re.search(r'^# (.+)$', content, re.MULTILINE)
             title = title_match.group(1) if title_match else fname.replace(".md", "").replace("_", " ")
 
             # Determine collection
