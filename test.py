@@ -385,12 +385,12 @@ def test_resolve_outline_api_key_prefers_file_then_env(tmp_path, monkeypatch):
     key_file.write_text("file-secret\n", encoding="utf-8")
     monkeypatch.setenv("OUTLINE_API_KEY", "env-secret")
 
-    file_value = convert.resolve_outline_api_key(
-        type("Args", (), {"outline_api_key_file": str(key_file)})()
-    )
-    env_value = convert.resolve_outline_api_key(
-        type("Args", (), {"outline_api_key_file": None})()
-    )
+    class Args:
+        def __init__(self, outline_api_key_file):
+            self.outline_api_key_file = outline_api_key_file
+
+    file_value = convert.resolve_outline_api_key(Args(str(key_file)))
+    env_value = convert.resolve_outline_api_key(Args(None))
 
     assert file_value == "file-secret"
     assert env_value == "env-secret"

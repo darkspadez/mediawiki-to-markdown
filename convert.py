@@ -1100,7 +1100,7 @@ def outline_upload_documents():
         for doc in result["data"]:
             doc_title = doc.get("title", "").strip().lower()
             doc_collection_id = doc.get("collectionId")
-            if doc_title == title.strip().lower() and doc_collection_id in (None, collection_id):
+            if doc_title == title.strip().lower() and doc_collection_id == collection_id:
                 return doc.get("id")
         return None
 
