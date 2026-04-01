@@ -29,6 +29,43 @@ from convert import (
     validate_local_links,
 )
 
+
+def build_outline_test_tree():
+    xml_text = f"""<?xml version="1.0" encoding="utf-8"?>
+<mediawiki xmlns="{convert.NS}">
+  <siteinfo>
+    <base>https://example.com/wiki/Main_Page</base>
+  </siteinfo>
+  <page>
+    <title>Aragorn</title>
+    <revision>
+      <timestamp>2024-01-02T03:04:05Z</timestamp>
+      <contributor><username>Elessar</username></contributor>
+      <text xml:space="preserve">[[Category:Characters]][[Category:Fellowship]]
+Aragorn carries [[Anduril]].</text>
+    </revision>
+  </page>
+  <page>
+    <title>Anduril</title>
+    <revision>
+      <timestamp>2024-01-03T03:04:05Z</timestamp>
+      <contributor><username>Elrond</username></contributor>
+      <text xml:space="preserve">[[Category:Artifacts]]
+Sword of kings.</text>
+    </revision>
+  </page>
+  <page>
+    <title>Strider</title>
+    <redirect title="Aragorn" />
+    <revision>
+      <timestamp>2024-01-04T03:04:05Z</timestamp>
+      <text xml:space="preserve">#REDIRECT [[Aragorn]]</text>
+    </revision>
+  </page>
+</mediawiki>
+"""
+    return ET.ElementTree(ET.fromstring(xml_text))
+
 # ── Obsidian-mode tests (existing behavior) ──────────────────────────
 
 # Test 1: Wikilink formatting
@@ -260,40 +297,7 @@ def test_plan_and_convert_outline_generates_secondary_indexes_redirects_and_meta
     monkeypatch.setattr(convert, "WIKI_BASE_URL", None)
     monkeypatch.setattr(convert, "convert_with_pandoc", lambda text, title="", output_format=None: text)
 
-    xml_text = f"""<?xml version="1.0" encoding="utf-8"?>
-<mediawiki xmlns="{convert.NS}">
-  <siteinfo>
-    <base>https://example.com/wiki/Main_Page</base>
-  </siteinfo>
-  <page>
-    <title>Aragorn</title>
-    <revision>
-      <timestamp>2024-01-02T03:04:05Z</timestamp>
-      <contributor><username>Elessar</username></contributor>
-      <text xml:space="preserve">[[Category:Characters]][[Category:Fellowship]]
-Aragorn carries [[Anduril]].</text>
-    </revision>
-  </page>
-  <page>
-    <title>Anduril</title>
-    <revision>
-      <timestamp>2024-01-03T03:04:05Z</timestamp>
-      <contributor><username>Elrond</username></contributor>
-      <text xml:space="preserve">[[Category:Artifacts]]
-Sword of kings.</text>
-    </revision>
-  </page>
-  <page>
-    <title>Strider</title>
-    <redirect title="Aragorn" />
-    <revision>
-      <timestamp>2024-01-04T03:04:05Z</timestamp>
-      <text xml:space="preserve">#REDIRECT [[Aragorn]]</text>
-    </revision>
-  </page>
-</mediawiki>
-"""
-    tree = ET.ElementTree(ET.fromstring(xml_text))
+    tree = build_outline_test_tree()
 
     extract_wiki_domain(tree)
     plan_pages(tree)

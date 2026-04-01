@@ -40,6 +40,7 @@ FOOTNOTE_DEF_REGEX = re.compile(r'^\[\^(\w+)\]:\s*(.+)$', re.MULTILINE)
 OBSIDIAN_IMAGE_EMBED_REGEX = re.compile(r'\\?!\[\[([^\]]+)\]\]')
 # Local markdown link target pattern
 MARKDOWN_LINK_TARGET_REGEX = re.compile(r'!?\[[^\]]*\]\(([^)]+)\)')
+MAX_BROKEN_LINK_WARNINGS = 10
 # Image content type mapping
 IMAGE_CONTENT_TYPES = {
     "jpg": "image/jpeg", "jpeg": "image/jpeg", "gif": "image/gif",
@@ -97,11 +98,17 @@ category_to_pages = defaultdict(list)
 
 WIKI_DOMAIN = None
 WIKI_BASE_URL = None
+# Planned export metadata keyed by normalized page title.
 page_output_paths = {}
+# Collected normalized tags for each non-redirect page.
 page_tags = {}
+# Preserved source metadata for each non-redirect page.
 page_source_metadata = {}
+# Redirect source title -> canonical target title.
 redirect_targets = {}
+# Redirect source title -> generated stub output path.
 redirect_output_paths = {}
+# All reserved relative output paths, used to avoid filename collisions.
 planned_output_paths = set()
 
 
@@ -202,7 +209,7 @@ def infer_infobox_tag(tags, infobox_data):
 def build_source_url(title):
     if not WIKI_BASE_URL:
         return None
-    base_prefix = WIKI_BASE_URL.rsplit('/', 1)[0]
+    base_prefix = WIKI_BASE_URL.rstrip('/').rsplit('/', 1)[0]
     return f"{base_prefix}/{url_quote(title.replace(' ', '_'))}"
 
 
@@ -372,6 +379,12 @@ def download_image(image_name):
         return None
 
 def get_infobox_data(wikicode):
+    """Return the first template node in the wikicode and its normalized data.
+
+    Returns a `(template, data)` tuple where `template` is the first
+    mwparserfromhell template node encountered in the page source or `None`,
+    and `data` is a plain dict of extracted infobox fields.
+    """
     infobox_data = {}
     infobox_template = None
     for template in wikicode.filter_templates():
@@ -946,7 +959,7 @@ def validate_local_links():
                     broken_links.append((filepath, raw_target))
 
     if broken_links:
-        for filepath, target in broken_links[:10]:
+        for filepath, target in broken_links[:MAX_BROKEN_LINK_WARNINGS]:
             logging.warning(f"⚠️ Broken local link in {filepath}: {target}")
         logging.warning(f"⚠️ Found {len(broken_links)} broken local links")
     else:
