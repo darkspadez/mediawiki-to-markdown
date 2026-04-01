@@ -13,6 +13,7 @@ This script converts a MediaWiki XML dump into clean Markdown — supporting bot
 - 📦 Converts infoboxes into structured metadata
 - 🔧 Infers tags from infobox types using noun inflection
 - 🖼️ Downloads and embeds images (`![[images/Filename]]` for Obsidian, `![alt](./images/Filename)` for Outline)
+- 🗄️ Optionally sources images from a local MediaWiki backup archive (`--images-archive`) instead of downloading them from the web
 - 🔗 Converts internal links to `[[Wikilinks]]` (Obsidian) or `[text](file.md)` (Outline)
 - 📚 Generates tag-based index files (`_indexes/` for Obsidian, collection folders for Outline)
 - 🐢 Supports Pandoc for better Markdown rendering (with Outline-optimized output)
@@ -78,6 +79,7 @@ python convert.py INPUT_XML --output-format outline \
 | `OUTLINE_API_KEY`    | Environment variable used for Outline API authentication        |
 | `--outline-api-key-file` | Optional file path containing the Outline API key          |
 | `--collection-id`    | Outline collection ID (creates "Imported Wiki" if omitted)     |
+| `--images-archive`   | Path to a MediaWiki images backup archive (e.g. `images.tar.gz`). Images are extracted from the archive instead of downloaded from the web. Accepts `.tar.gz`, `.tar.bz2`, `.tar.xz`, or plain `.tar`. |
 
 ## 📤 Exporting Your MediaWiki Content
 
@@ -139,13 +141,24 @@ still back up uploads separately if you are doing a serious migration.
 
 #### Quick backup: copy the uploads directory
 
-If you have filesystem access, archive the MediaWiki uploads directory directly:
+If you have filesystem access, archive the MediaWiki uploads directory directly.
+MediaWiki stores uploads under an `images/` directory that is internally organised
+into hash-based subdirectories (`images/a/ab/filename.ext`).  The converter only
+needs the file **basenames** — it ignores the internal directory structure — so a
+simple recursive archive of that folder is all you need:
 
 ```bash
+# Run this from the directory that CONTAINS the MediaWiki images/ folder
 tar -czf mediawiki-images.tar.gz images/
 ```
 
-That gives you a full copy of uploaded files, including anything not currently referenced by pages.
+That produces a single `.tar.gz` file you can pass to `--images-archive` later.
+The resulting archive contains paths like `images/a/ab/photo.jpg`; the converter
+will find `photo.jpg` regardless of which subdirectory it lives in.
+
+> **Tip:** run this command from the MediaWiki installation root (the directory
+> that contains the `images/` folder), not from inside `images/` itself.  That
+> way the archive preserves the full `images/…` prefix and nothing gets confused.
 
 #### Selective backup: `dumpUploads`
 
@@ -197,9 +210,24 @@ pip install -r requirements.txt
 
 ### 3. Run a local Outline-format export
 
+**If the source wiki is still reachable**, the converter will download images automatically:
+
 ```bash
 python convert.py mediawiki.xml outline_export --output-format outline --verbose
 ```
+
+**If the source wiki is offline or private**, pass the images archive you created earlier so the converter can source images locally instead of hitting the network:
+
+```bash
+python convert.py mediawiki.xml outline_export \
+  --output-format outline \
+  --images-archive mediawiki-images.tar.gz \
+  --verbose
+```
+
+> When `--images-archive` is provided, the archive is treated as the **authoritative** image source.
+> If an image referenced in the wiki pages is not present in the archive, it is skipped rather than
+> downloaded from the web.
 
 What this does:
 
@@ -266,10 +294,15 @@ After upload:
 
 For a safer migration, use this order:
 
-1. Export XML from MediaWiki
-2. Back up uploads/images
-3. Run a local Outline-format export without upload
-4. Review the generated Markdown
+1. Export XML from MediaWiki (`dumpBackup --current`)
+2. Back up uploads/images: `tar -czf mediawiki-images.tar.gz images/` (run from the MediaWiki root)
+3. Run a local Outline-format export with the archive (no upload yet):
+   ```bash
+   python convert.py mediawiki.xml outline_export \
+     --output-format outline \
+     --images-archive mediawiki-images.tar.gz
+   ```
+4. Review the generated Markdown and confirm images landed in `outline_export/images/`
 5. Run the Outline upload step
 6. Validate the imported content in Outline
 
