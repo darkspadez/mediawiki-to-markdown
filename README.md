@@ -18,6 +18,9 @@ This script converts a MediaWiki XML dump into clean Markdown — supporting bot
 - 🐢 Supports Pandoc for better Markdown rendering (with Outline-optimized output)
 - 🔍 Verbose mode for detailed output and easier troubleshooting
 - 🧹 Strips HTML artifacts, converts footnotes, and handles definition lists (Outline mode)
+- ↪️ Preserves redirects as stub documents and resolves Outline links against planned output paths
+- 🧾 Preserves source metadata such as the last editor, timestamp, and source URL in exported headers
+- ✅ Validates generated local Markdown links after export
 - 📤 Optional direct upload to Outline via API
 
 ## Support
@@ -119,6 +122,8 @@ outline_output/
 | Metadata             | YAML frontmatter (`---`)        | `# Title` + metadata table           |
 | Categories           | Tags in YAML                    | Collection subdirectories             |
 | Index pages          | `_indexes/` with wikilinks      | `index.md` per collection folder     |
+| Redirects            | Normal pages or skipped         | Redirect stub docs linking to targets |
+| Link validation      | Not applicable                  | Post-export local markdown link check |
 | HTML in output       | Preserved                       | Stripped (sup/sub → LaTeX)            |
 | Footnotes            | Markdown footnotes              | Numbered references section           |
 | Tables               | Pandoc Markdown tables          | Pipe tables (strict compatibility)    |

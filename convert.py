@@ -12,7 +12,7 @@ import yaml
 import argparse
 import inflect
 import logging
-from urllib.parse import quote as url_quote
+from urllib.parse import quote as url_quote, unquote as url_unquote
 from tqdm import tqdm
 
 p = inflect.engine()
@@ -38,6 +38,8 @@ FOOTNOTE_REF_REGEX = re.compile(r'\[\^(\w+)\](?!:)')
 FOOTNOTE_DEF_REGEX = re.compile(r'^\[\^(\w+)\]:\s*(.+)$', re.MULTILINE)
 # Obsidian image embed pattern (escaped or not)
 OBSIDIAN_IMAGE_EMBED_REGEX = re.compile(r'\\?!\[\[([^\]]+)\]\]')
+# Local markdown link target pattern
+MARKDOWN_LINK_TARGET_REGEX = re.compile(r'!?\[[^\]]*\]\(([^)]+)\)')
 # Image content type mapping
 IMAGE_CONTENT_TYPES = {
     "jpg": "image/jpeg", "jpeg": "image/jpeg", "gif": "image/gif",
@@ -94,13 +96,145 @@ filename_counts = defaultdict(int)
 category_to_pages = defaultdict(list)
 
 WIKI_DOMAIN = None
+WIKI_BASE_URL = None
+page_output_paths = {}
+page_tags = {}
+page_source_metadata = {}
+redirect_targets = {}
+redirect_output_paths = {}
+planned_output_paths = set()
+
+
+def reset_runtime_state():
+    tag_to_pages.clear()
+    filename_counts.clear()
+    category_to_pages.clear()
+    page_output_paths.clear()
+    page_tags.clear()
+    page_source_metadata.clear()
+    redirect_targets.clear()
+    redirect_output_paths.clear()
+    planned_output_paths.clear()
+
+
+def normalize_page_title(title):
+    return title.replace('_', ' ').strip()
+
+
+def quote_path(path):
+    return "/".join(url_quote(part) for part in path.split("/"))
+
+
+def format_relative_link(path):
+    path = path.replace(os.sep, '/')
+    if not path.startswith(('./', '../', '/')):
+        path = f"./{path}"
+    return quote_path(path)
+
+
+def build_relative_output_link(target_relpath, current_page_path=None):
+    if current_page_path:
+        current_dir = os.path.dirname(current_page_path) or "."
+        relpath = os.path.relpath(target_relpath, start=current_dir)
+    else:
+        relpath = target_relpath
+    return format_relative_link(relpath)
+
+
+def allocate_output_path(base_name, subdir=""):
+    suffix = 0
+    while True:
+        filename = f"{base_name}{'_' + str(suffix) if suffix else ''}.md"
+        relpath = os.path.join(subdir, filename) if subdir else filename
+        relpath = relpath.replace(os.sep, '/')
+        if relpath not in planned_output_paths:
+            planned_output_paths.add(relpath)
+            return relpath
+        suffix += 1
+
+
+def build_asset_embed(image_name, local_filename, output_format=None, current_page_path=None):
+    fmt = output_format or OUTPUT_FORMAT
+    image_relpath = os.path.join(IMAGE_DIR, local_filename).replace(os.sep, '/')
+    if fmt == "outline":
+        link = build_relative_output_link(image_relpath, current_page_path=current_page_path)
+        return f"![{image_name}]({link})"
+    return f"![[{IMAGE_DIR}/{local_filename}]]"
+
+
+def resolve_page_link(target, current_page_path=None, output_format=None):
+    fmt = output_format or OUTPUT_FORMAT
+    if fmt != "outline":
+        return None
+
+    page_target, _, anchor = target.partition('#')
+    normalized_target = normalize_page_title(page_target)
+    normalized_target = redirect_targets.get(normalized_target, normalized_target)
+    target_relpath = page_output_paths.get(normalized_target)
+
+    if target_relpath:
+        link = build_relative_output_link(target_relpath, current_page_path=current_page_path)
+    else:
+        fallback_name = f"{clean_filename(page_target)}.md"
+        link = format_relative_link(fallback_name)
+
+    if anchor:
+        return f"{link}#{url_quote(anchor)}"
+    return link
+
+
+def infer_infobox_tag(tags, infobox_data):
+    updated_tags = list(tags)
+    if infobox_data.get('infobox'):
+        infobox_name = str(infobox_data['infobox'])
+
+        if not p.singular_noun(infobox_name):
+            infobox_name = p.plural(infobox_name)
+
+        inferred_tag = normalize_tag(infobox_name)
+
+        if inferred_tag not in updated_tags:
+            updated_tags.append(inferred_tag)
+
+    return updated_tags
+
+
+def build_source_url(title):
+    if not WIKI_BASE_URL:
+        return None
+    base_prefix = WIKI_BASE_URL.rsplit('/', 1)[0]
+    return f"{base_prefix}/{url_quote(title.replace(' ', '_'))}"
+
+
+def extract_source_metadata(title, revision):
+    metadata = {}
+
+    timestamp_elem = revision.find(TAG("timestamp"))
+    if timestamp_elem is not None and timestamp_elem.text:
+        metadata["source_last_modified"] = timestamp_elem.text.strip()
+
+    contributor = revision.find(TAG("contributor"))
+    if contributor is not None:
+        username = contributor.find(TAG("username"))
+        ip_addr = contributor.find(TAG("ip"))
+        if username is not None and username.text:
+            metadata["source_last_editor"] = username.text.strip()
+        elif ip_addr is not None and ip_addr.text:
+            metadata["source_last_editor"] = ip_addr.text.strip()
+
+    source_url = build_source_url(title)
+    if source_url:
+        metadata["source_url"] = source_url
+
+    return metadata
 
 def extract_wiki_domain(tree):
-    global WIKI_DOMAIN
+    global WIKI_DOMAIN, WIKI_BASE_URL
     ns = {"ns": NS}
     base_elem = tree.find(".//ns:siteinfo/ns:base", ns)
     if base_elem is not None and base_elem.text:
         base_url = base_elem.text.strip()
+        WIKI_BASE_URL = base_url
         match = re.match(r"https?://([^/]+)/", base_url)
         if match:
             WIKI_DOMAIN = match.group(1)
@@ -118,7 +252,7 @@ def display_title(title):
     """Convert to human-readable title with spaces"""
     return title.replace('_', ' ')
 
-def clean_wikilink(link_content, output_format=None):
+def clean_wikilink(link_content, output_format=None, current_page_path=None):
     """Centralized wikilink cleaning.
     In obsidian mode: [[Target|Alias]] or [[Target]]
     In outline mode: [Alias](Target.md) or [Target](Target.md)
@@ -128,20 +262,25 @@ def clean_wikilink(link_content, output_format=None):
         target, alias = link_content.split('|', 1)
         clean_target = target.replace('_', ' ')
         if fmt == "outline":
-            filename = clean_filename(target) + ".md"
-            return f"[{alias}](./{url_quote(filename)})"
+            link = resolve_page_link(target, current_page_path=current_page_path, output_format=fmt)
+            return f"[{alias}]({link})"
         return f"[[{clean_target}|{alias}]]"
     clean = link_content.replace('_', ' ')
     if fmt == "outline":
-        filename = clean_filename(link_content) + ".md"
-        return f"[{clean}](./{url_quote(filename)})"
+        link = resolve_page_link(link_content, current_page_path=current_page_path, output_format=fmt)
+        return f"[{clean}]({link})"
     return f"[[{clean}]]"
 
-def fix_wikilink_spacing(text, output_format=None):
+def fix_wikilink_spacing(text, output_format=None, current_page_path=None):
     """Convert underscores to spaces in wikilinks using centralized cleaner"""
     fmt = output_format or OUTPUT_FORMAT
     return WIKILINK_REGEX.sub(
-        lambda m: clean_wikilink(m.group(1), output_format=fmt), text
+        lambda m: clean_wikilink(
+            m.group(1),
+            output_format=fmt,
+            current_page_path=current_page_path,
+        ),
+        text
     )
 
 def extract_categories(wikicode):
@@ -154,7 +293,7 @@ def extract_categories(wikicode):
             wikicode.remove(link)
     return wikicode, categories
 
-def extract_images(wikicode, output_format=None):
+def extract_images(wikicode, output_format=None, current_page_path=None):
     fmt = output_format or OUTPUT_FORMAT
     images = set()
     nodes = list(wikicode.nodes)  # make a list copy because we'll modify
@@ -167,10 +306,12 @@ def extract_images(wikicode, output_format=None):
                 local_filename = download_image(image_name)
 
                 if local_filename:
-                    if fmt == "outline":
-                        embed_link = f"![{image_name}](./{IMAGE_DIR}/{url_quote(local_filename)})"
-                    else:
-                        embed_link = f"![[{IMAGE_DIR}/{local_filename}]]"
+                    embed_link = build_asset_embed(
+                        image_name,
+                        local_filename,
+                        output_format=fmt,
+                        current_page_path=current_page_path,
+                    )
 
                     # Replace the wikilink node in wikicode directly
                     wikicode.replace(node, embed_link)
@@ -230,18 +371,16 @@ def download_image(image_name):
         logging.error(f"❌ Error downloading {image_name}: {e}")
         return None
 
-def extract_infobox(wikicode, output_format=None):
-    fmt = output_format or OUTPUT_FORMAT
+def get_infobox_data(wikicode):
     infobox_data = {}
     infobox_template = None
-
     for template in wikicode.filter_templates():
         if template.name.strip():
             infobox_template = template
             break
 
     if not infobox_template:
-        return wikicode, {}
+        return None, {}
 
     raw_name = infobox_template.name.strip().lower()
     if raw_name.startswith("infobox_"):
@@ -270,17 +409,30 @@ def extract_infobox(wikicode, output_format=None):
         else:
             infobox_data[key] = val
 
+    return infobox_template, infobox_data
+
+
+def extract_infobox(wikicode, output_format=None, current_page_path=None):
+    fmt = output_format or OUTPUT_FORMAT
+    infobox_template, infobox_data = get_infobox_data(wikicode)
+
+    if not infobox_template:
+        return wikicode, {}
+
     wikicode.remove(infobox_template)
 
     # Extract the image from the infobox and inline it at top of markdown
     if image_name := infobox_data.get('image'):
         image_name = image_name.strip()
-        download_image(image_name)
-        if fmt == "outline":
-            embed = f"![{image_name}](./{IMAGE_DIR}/{url_quote(image_name)})\n\n"
-        else:
-            embed = f"![[{IMAGE_DIR}/{image_name}]]\n\n"
-        wikicode.insert(0, embed)
+        local_filename = download_image(image_name)
+        if local_filename:
+            embed = build_asset_embed(
+                image_name,
+                local_filename,
+                output_format=fmt,
+                current_page_path=current_page_path,
+            )
+            wikicode.insert(0, f"{embed}\n\n")
 
     return wikicode, infobox_data
 
@@ -344,7 +496,7 @@ def _extract_outline_header(title, tags, extra_fields=None):
 def clean_heading_ids(md_text):
     return HEADING_ID_REGEX.sub(r'\1', md_text)
 
-def extract_links_from_pandoc(md_text, output_format=None):
+def extract_links_from_pandoc(md_text, output_format=None, current_page_path=None):
     fmt = output_format or OUTPUT_FORMAT
     def replacer(match):
         text = match.group(1).strip()
@@ -356,8 +508,8 @@ def extract_links_from_pandoc(md_text, output_format=None):
         clean_target = display_title(target)
 
         if fmt == "outline":
-            filename = clean_filename(target) + ".md"
-            return f"[{text}](./{url_quote(filename)})"
+            link = resolve_page_link(target, current_page_path=current_page_path, output_format=fmt)
+            return f"[{text}]({link})"
 
         # Only include alias if it's actually different
         if text == clean_target:
@@ -369,14 +521,15 @@ def extract_links_from_pandoc(md_text, output_format=None):
 def clean_residual_wikilink_artifacts(md_text):
     return md_text.replace(' "wikilink"', '')
 
-def fix_image_links(md, output_format=None):
+def fix_image_links(md, output_format=None, current_page_path=None):
     fmt = output_format or OUTPUT_FORMAT
     if fmt == "outline":
         # Convert any remaining Obsidian-style image embeds to standard markdown
         def _replace_obsidian_embed(m):
             path = m.group(1)
             name = path.split("/")[-1] if "/" in path else path
-            return f"![{name}](./{path})"
+            link = build_relative_output_link(path, current_page_path=current_page_path)
+            return f"![{name}]({link})"
         return OBSIDIAN_IMAGE_EMBED_REGEX.sub(_replace_obsidian_embed, md)
     return re.sub(r'\\(!\[\[)', r'\1', md)
 
@@ -469,13 +622,13 @@ def convert_definition_lists(md_text):
             i += 1
     return '\n'.join(result)
 
-def cleanup_markdown(md, output_format=None):
+def cleanup_markdown(md, output_format=None, current_page_path=None):
     fmt = output_format or OUTPUT_FORMAT
     md = clean_heading_ids(md)
-    md = extract_links_from_pandoc(md, output_format=fmt)
+    md = extract_links_from_pandoc(md, output_format=fmt, current_page_path=current_page_path)
     md = clean_residual_wikilink_artifacts(md)
-    md = fix_wikilink_spacing(md, output_format=fmt)
-    md = fix_image_links(md, output_format=fmt)
+    md = fix_wikilink_spacing(md, output_format=fmt, current_page_path=current_page_path)
+    md = fix_image_links(md, output_format=fmt, current_page_path=current_page_path)
     if fmt == "outline":
         md = strip_html_artifacts(md)
         md = convert_footnotes(md)
@@ -505,33 +658,100 @@ def convert_with_pandoc(text, title="", output_format=None):
         return text
 
 def clean_and_convert_text(raw_text, title, output_format=None):
+    return clean_and_convert_text_with_metadata(raw_text, title, output_format=output_format)
+
+
+def collect_page_tags(raw_text):
+    text = unescape(raw_text)
+    wikicode = mwparserfromhell.parse(text)
+    wikicode, tags = extract_categories(wikicode)
+    _infobox_template, infobox_data = get_infobox_data(wikicode)
+    return infer_infobox_tag(tags, infobox_data)
+
+
+def clean_and_convert_text_with_metadata(
+    raw_text,
+    title,
+    output_format=None,
+    current_page_path=None,
+    extra_fields=None,
+):
     fmt = output_format or OUTPUT_FORMAT
     text = unescape(raw_text)
     wikicode = mwparserfromhell.parse(text)
     wikicode, tags = extract_categories(wikicode)
-    wikicode = extract_images(wikicode, output_format=fmt)
-    wikicode, infobox_data = extract_infobox(wikicode, output_format=fmt)
+    wikicode = extract_images(
+        wikicode,
+        output_format=fmt,
+        current_page_path=current_page_path,
+    )
+    wikicode, infobox_data = extract_infobox(
+        wikicode,
+        output_format=fmt,
+        current_page_path=current_page_path,
+    )
 
-    # Conditionally infer tag
-    if infobox_data.get('infobox'):
-        infobox_name = str(infobox_data['infobox'])
-
-        if not p.singular_noun(infobox_name):
-            infobox_name = p.plural(infobox_name)
-
-        inferred_tag = normalize_tag(infobox_name)
-
-        if inferred_tag not in tags:
-            tags.append(inferred_tag)
+    tags = infer_infobox_tag(tags, infobox_data)
 
     cleaned_text = str(wikicode).strip()
-    header = extract_yaml_header(title, tags, infobox_data, output_format=fmt)
-
-    # Track tags for index
-    for tag in tags:
-        tag_to_pages[tag].append(title)
+    merged_fields = dict(infobox_data)
+    if extra_fields:
+        merged_fields.update(extra_fields)
+    header = extract_yaml_header(title, tags, merged_fields, output_format=fmt)
 
     return header, cleaned_text, tags
+
+
+def plan_pages(tree):
+    ns = {"ns": NS}
+
+    for page in tree.findall(".//ns:page", ns):
+        title_elem = page.find("ns:title", ns)
+        if title_elem is None or not title_elem.text:
+            continue
+
+        title = title_elem.text.strip()
+        normalized_title = normalize_page_title(title)
+        redirect_elem = page.find("ns:redirect", ns)
+
+        if redirect_elem is not None:
+            redirect_target = redirect_elem.attrib.get("title", "").strip()
+            if redirect_target:
+                redirect_targets[normalized_title] = normalize_page_title(redirect_target)
+            continue
+
+        revision = page.find(TAG("revision"))
+        if revision is None:
+            continue
+
+        text_elem = revision.find(TAG("text"))
+        if text_elem is None or not text_elem.text or not text_elem.text.strip():
+            continue
+
+        tags = collect_page_tags(text_elem.text)
+        page_tags[normalized_title] = tags
+        page_source_metadata[normalized_title] = extract_source_metadata(title, revision)
+
+        for tag in tags:
+            tag_to_pages[tag].append(title)
+
+        subdir = ""
+        if OUTPUT_FORMAT == "outline" and tags:
+            subdir = clean_filename(tags[0])
+
+        page_output_paths[normalized_title] = allocate_output_path(clean_filename(title), subdir=subdir)
+
+    if SKIP_REDIRECTS:
+        return
+
+    for redirect_title, target_title in redirect_targets.items():
+        target_path = page_output_paths.get(target_title, "")
+        subdir = os.path.dirname(target_path)
+        redirect_output_paths[redirect_title] = allocate_output_path(
+            clean_filename(redirect_title),
+            subdir=subdir,
+        )
+
 
 def convert_pages(tree):
     ns = {"ns": NS}
@@ -551,7 +771,12 @@ def convert_pages(tree):
                 pbar.update(1)
                 continue
 
+            if page.find("ns:redirect", ns) is not None:
+                pbar.update(1)
+                continue
+
             title = title_elem.text.strip()
+            normalized_title = normalize_page_title(title)
             logging.debug(f"✅ Found page: {title}")
 
             revision = page.find(TAG("revision"))
@@ -567,26 +792,28 @@ def convert_pages(tree):
                 continue
 
             raw_text = text_elem.text
-            header_str, wikitext, tags = clean_and_convert_text(raw_text, title)
-            wikitext = convert_with_pandoc(wikitext, title)
-            wikitext = cleanup_markdown(wikitext)
-            markdown = f"{header_str}\n{wikitext.strip()}\n"
-            base_filename = clean_filename(title)
-            count = filename_counts[base_filename]
-            filename_counts[base_filename] += 1
-            filename = f"{base_filename}{'_' + str(count) if count else ''}.md"
+            current_page_path = page_output_paths.get(normalized_title)
+            if not current_page_path:
+                logging.warning(f"⚠️ No planned output path for: {title}")
+                pbar.update(1)
+                continue
 
-            if OUTPUT_FORMAT == "outline" and tags:
-                # Place in subdirectory for primary category (first tag)
-                primary_cat = tags[0]
-                cat_dir = os.path.join(OUTPUT_DIR, clean_filename(primary_cat))
-                os.makedirs(cat_dir, exist_ok=True)
-                filepath = os.path.join(cat_dir, filename)
-                # Track for collection mapping
-                for tag in tags:
-                    category_to_pages[tag].append((title, filename))
-            else:
-                filepath = os.path.join(OUTPUT_DIR, filename)
+            header_str, wikitext, tags = clean_and_convert_text_with_metadata(
+                raw_text,
+                title,
+                output_format=OUTPUT_FORMAT,
+                current_page_path=current_page_path,
+                extra_fields=page_source_metadata.get(normalized_title),
+            )
+            wikitext = convert_with_pandoc(wikitext, title)
+            wikitext = cleanup_markdown(
+                wikitext,
+                output_format=OUTPUT_FORMAT,
+                current_page_path=current_page_path,
+            )
+            markdown = f"{header_str}\n{wikitext.strip()}\n"
+            filepath = os.path.join(OUTPUT_DIR, current_page_path)
+            os.makedirs(os.path.dirname(filepath) or OUTPUT_DIR, exist_ok=True)
 
             with open(filepath, "w", encoding="utf-8") as f:
                 logging.debug(f"✍️ Writing: {filepath}")
@@ -595,6 +822,58 @@ def convert_pages(tree):
             pbar.update(1)
 
     logging.info("✅ Main articles converted")
+
+
+def create_redirect_stubs():
+    if SKIP_REDIRECTS:
+        return
+
+    for redirect_title, target_title in redirect_targets.items():
+        target_relpath = page_output_paths.get(target_title)
+        redirect_relpath = redirect_output_paths.get(redirect_title)
+        if not target_relpath or not redirect_relpath:
+            continue
+
+        redirect_display = display_title(redirect_title)
+        target_display = display_title(target_title)
+
+        if OUTPUT_FORMAT == "outline":
+            link = resolve_page_link(
+                target_title,
+                current_page_path=redirect_relpath,
+                output_format=OUTPUT_FORMAT,
+            )
+            extra_fields = {"redirect_target": target_display}
+            source_url = build_source_url(redirect_title)
+            if source_url:
+                extra_fields["source_url"] = source_url
+            content = (
+                extract_yaml_header(
+                    redirect_display,
+                    [],
+                    extra_fields,
+                    output_format=OUTPUT_FORMAT,
+                )
+                + f"\nRedirects to [{target_display}]({link}).\n"
+            )
+        else:
+            content = (
+                extract_yaml_header(
+                    redirect_display,
+                    [],
+                    {"redirect_target": target_display},
+                    output_format=OUTPUT_FORMAT,
+                )
+                + f"\nRedirects to [[{target_display}]].\n"
+            )
+
+        filepath = os.path.join(OUTPUT_DIR, redirect_relpath)
+        os.makedirs(os.path.dirname(filepath) or OUTPUT_DIR, exist_ok=True)
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write(content)
+
+    if redirect_output_paths:
+        logging.info("↪️ Redirect stubs created")
 
 def create_tag_indexes():
     if OUTPUT_FORMAT == "outline":
@@ -623,12 +902,17 @@ def _create_outline_collection_indexes():
         display_tag = display_title(tag)
         cat_dir = os.path.join(OUTPUT_DIR, clean_filename(tag))
         os.makedirs(cat_dir, exist_ok=True)
+        index_relpath = os.path.join(clean_filename(tag), "index.md").replace(os.sep, '/')
 
         lines = [f"# {display_tag.title()}", ""]
         for page in sorted(pages):
             display_page = display_title(page)
-            filename = clean_filename(page) + ".md"
-            lines.append(f"- [{display_page}](./{url_quote(filename)})")
+            link = resolve_page_link(
+                page,
+                current_page_path=index_relpath,
+                output_format="outline",
+            )
+            lines.append(f"- [{display_page}]({link})")
 
         content = "\n".join(lines) + "\n"
         index_path = os.path.join(cat_dir, "index.md")
@@ -636,6 +920,39 @@ def _create_outline_collection_indexes():
             f.write(content)
 
     logging.info("📚 Collection index pages created for Outline")
+
+
+def validate_local_links():
+    broken_links = []
+
+    for root, _dirs, files in os.walk(OUTPUT_DIR):
+        for filename in files:
+            if not filename.endswith(".md"):
+                continue
+
+            filepath = os.path.join(root, filename)
+            with open(filepath, "r", encoding="utf-8") as f:
+                content = f.read()
+
+            for raw_target in MARKDOWN_LINK_TARGET_REGEX.findall(content):
+                target = raw_target.strip()
+                if not target or target.startswith(('http://', 'https://', 'mailto:', '#')):
+                    continue
+
+                target_path = target.split('#', 1)[0]
+                target_path = url_unquote(target_path)
+                candidate = os.path.normpath(os.path.join(root, target_path))
+                if not os.path.exists(candidate):
+                    broken_links.append((filepath, raw_target))
+
+    if broken_links:
+        for filepath, target in broken_links[:10]:
+            logging.warning(f"⚠️ Broken local link in {filepath}: {target}")
+        logging.warning(f"⚠️ Found {len(broken_links)} broken local links")
+    else:
+        logging.info("🔗 Local link validation passed")
+
+    return broken_links
 
 def outline_api_request(endpoint, data=None, files=None):
     """Make an authenticated request to the Outline API."""
@@ -779,6 +1096,7 @@ def outline_upload_documents():
 def main():
     fmt_label = "Outline" if OUTPUT_FORMAT == "outline" else "Obsidian Vault"
     logging.info(f"🔄 Converting MediaWiki XML to {fmt_label}...")
+    reset_runtime_state()
     try:
         tree = ET.parse(INPUT_XML)
     except ET.ParseError as e:
@@ -791,8 +1109,11 @@ def main():
         logging.error(f"❌ {e}")
         return
 
+    plan_pages(tree)
     convert_pages(tree)
+    create_redirect_stubs()
     create_tag_indexes()
+    validate_local_links()
 
     if OUTPUT_FORMAT == "outline" and OUTLINE_URL and OUTLINE_API_KEY:
         outline_upload_documents()

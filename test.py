@@ -1,10 +1,12 @@
 import pytest
 import sys
 import os
+import xml.etree.ElementTree as ET
 
 # Patch sys.argv before importing convert, since parse_args() runs at module level
 sys.argv = ['convert.py', '/dev/null']
 
+import convert
 import mwparserfromhell
 from convert import (
     clean_wikilink,
@@ -19,6 +21,12 @@ from convert import (
     convert_definition_lists,
     fix_image_links,
     _extract_outline_header,
+    extract_wiki_domain,
+    plan_pages,
+    convert_pages,
+    create_redirect_stubs,
+    create_tag_indexes,
+    validate_local_links,
 )
 
 # ── Obsidian-mode tests (existing behavior) ──────────────────────────
@@ -161,6 +169,15 @@ def test_fix_image_links_outline_escaped():
     result = fix_image_links(md, output_format="outline")
     assert "![photo.jpg](./images/photo.jpg)" in result
 
+def test_fix_image_links_outline_relative_to_category_page():
+    md = "Some text ![[images/photo.jpg]] more text"
+    result = fix_image_links(
+        md,
+        output_format="outline",
+        current_page_path="characters/Aragorn.md",
+    )
+    assert "![photo.jpg](../images/photo.jpg)" in result
+
 # Test: HTML artifact stripping
 def test_strip_html_br():
     assert strip_html_artifacts("Hello<br>World") == "Hello\n\nWorld"
@@ -219,3 +236,114 @@ def test_clean_and_convert_text_outline():
     assert "# One Ring" in header
     assert "---\n" not in header.split("# ")[0]  # No YAML frontmatter before title
     assert "items" in [t.lower() for t in tags]
+
+
+def test_clean_wikilink_outline_uses_planned_relative_paths(monkeypatch):
+    convert.reset_runtime_state()
+    monkeypatch.setitem(convert.page_output_paths, "One Ring", "items/One_Ring.md")
+
+    result = clean_wikilink(
+        "One_Ring",
+        output_format="outline",
+        current_page_path="characters/Aragorn.md",
+    )
+
+    assert result == "[One Ring](../items/One_Ring.md)"
+
+
+def test_plan_and_convert_outline_generates_secondary_indexes_redirects_and_metadata(tmp_path, monkeypatch):
+    convert.reset_runtime_state()
+    monkeypatch.setattr(convert, "OUTPUT_DIR", str(tmp_path))
+    monkeypatch.setattr(convert, "OUTPUT_FORMAT", "outline")
+    monkeypatch.setattr(convert, "SKIP_REDIRECTS", False)
+    monkeypatch.setattr(convert, "WIKI_DOMAIN", None)
+    monkeypatch.setattr(convert, "WIKI_BASE_URL", None)
+    monkeypatch.setattr(convert, "convert_with_pandoc", lambda text, title="", output_format=None: text)
+
+    xml_text = f"""<?xml version="1.0" encoding="utf-8"?>
+<mediawiki xmlns="{convert.NS}">
+  <siteinfo>
+    <base>https://example.com/wiki/Main_Page</base>
+  </siteinfo>
+  <page>
+    <title>Aragorn</title>
+    <revision>
+      <timestamp>2024-01-02T03:04:05Z</timestamp>
+      <contributor><username>Elessar</username></contributor>
+      <text xml:space="preserve">[[Category:Characters]][[Category:Fellowship]]
+Aragorn carries [[Anduril]].</text>
+    </revision>
+  </page>
+  <page>
+    <title>Anduril</title>
+    <revision>
+      <timestamp>2024-01-03T03:04:05Z</timestamp>
+      <contributor><username>Elrond</username></contributor>
+      <text xml:space="preserve">[[Category:Artifacts]]
+Sword of kings.</text>
+    </revision>
+  </page>
+  <page>
+    <title>Strider</title>
+    <redirect title="Aragorn" />
+    <revision>
+      <timestamp>2024-01-04T03:04:05Z</timestamp>
+      <text xml:space="preserve">#REDIRECT [[Aragorn]]</text>
+    </revision>
+  </page>
+</mediawiki>
+"""
+    tree = ET.ElementTree(ET.fromstring(xml_text))
+
+    extract_wiki_domain(tree)
+    plan_pages(tree)
+    convert_pages(tree)
+    create_redirect_stubs()
+    create_tag_indexes()
+
+    aragorn_path = tmp_path / "characters" / "Aragorn.md"
+    anduril_path = tmp_path / "artifacts" / "Anduril.md"
+    redirect_path = tmp_path / "characters" / "Strider.md"
+    fellowship_index = tmp_path / "fellowship" / "index.md"
+
+    assert aragorn_path.exists()
+    assert anduril_path.exists()
+    assert redirect_path.exists()
+    assert fellowship_index.exists()
+
+    aragorn_content = aragorn_path.read_text(encoding="utf-8")
+    redirect_content = redirect_path.read_text(encoding="utf-8")
+    fellowship_content = fellowship_index.read_text(encoding="utf-8")
+
+    assert "[Anduril](../artifacts/Anduril.md)" in aragorn_content
+    assert "Source Last Modified" in aragorn_content
+    assert "2024-01-02T03:04:05Z" in aragorn_content
+    assert "Source Last Editor" in aragorn_content
+    assert "Elessar" in aragorn_content
+    assert "Source Url" in aragorn_content
+    assert "https://example.com/wiki/Aragorn" in aragorn_content
+
+    assert "Redirects to [Aragorn](./Aragorn.md)." in redirect_content
+    assert "[Aragorn](../characters/Aragorn.md)" in fellowship_content
+    assert validate_local_links() == []
+
+
+def test_plan_pages_handles_filename_collisions_for_links(monkeypatch):
+    convert.reset_runtime_state()
+    monkeypatch.setattr(convert, "OUTPUT_FORMAT", "outline")
+    monkeypatch.setitem(convert.page_output_paths, "Alpha/Beta", "items/Alpha_Beta.md")
+    monkeypatch.setitem(convert.page_output_paths, "Alpha:Beta", "items/Alpha_Beta_1.md")
+
+    first = clean_wikilink(
+        "Alpha/Beta",
+        output_format="outline",
+        current_page_path="items/Reference.md",
+    )
+    second = clean_wikilink(
+        "Alpha:Beta",
+        output_format="outline",
+        current_page_path="items/Reference.md",
+    )
+
+    assert first == "[Alpha/Beta](./Alpha_Beta.md)"
+    assert second == "[Alpha:Beta](./Alpha_Beta_1.md)"
