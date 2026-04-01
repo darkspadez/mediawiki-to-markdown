@@ -73,7 +73,7 @@ def test_extract_infobox_and_tags():
 [[Category:Characters]]
 """
     wikicode = mwparserfromhell.parse(wikitext)
-    cleaned_wikicode, infobox = extract_infobox(wikicode, output_format="obsidian")
+    _cleaned_wikicode, infobox = extract_infobox(wikicode, output_format="obsidian")
 
     assert infobox["infobox"] == "Character"
     assert "name" in infobox
@@ -88,7 +88,7 @@ def test_clean_and_convert_text_adds_infobox_tag():
 }}
 [[Category:Items]]
 """
-    header, text, tags = clean_and_convert_text(wikitext, "One_Ring", output_format="obsidian")
+    header, _text, tags = clean_and_convert_text(wikitext, "One_Ring", output_format="obsidian")
     assert "artifacts" in [t.lower() for t in tags]
     assert "items" in [t.lower() for t in tags]
     assert "---" in header
@@ -215,7 +215,7 @@ def test_clean_and_convert_text_outline():
 }}
 [[Category:Items]]
 """
-    header, text, tags = clean_and_convert_text(wikitext, "One_Ring", output_format="outline")
+    header, _text, tags = clean_and_convert_text(wikitext, "One_Ring", output_format="outline")
     assert "# One Ring" in header
     assert "---\n" not in header.split("# ")[0]  # No YAML frontmatter before title
     assert "items" in [t.lower() for t in tags]

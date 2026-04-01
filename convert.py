@@ -692,7 +692,7 @@ def outline_upload_image(filepath):
             )
         if result and result.get("data"):
             return result["data"].get("url")
-    except Exception as e:
+    except (OSError, IOError, requests.RequestException) as e:
         logging.error(f"❌ Failed to upload image {filename}: {e}")
     return None
 
@@ -729,7 +729,7 @@ def outline_upload_documents():
 
     # Walk through output directory and upload documents
     uploaded = 0
-    for root, dirs, files in os.walk(OUTPUT_DIR):
+    for root, _dirs, files in os.walk(OUTPUT_DIR):
         for fname in files:
             if not fname.endswith(".md"):
                 continue
