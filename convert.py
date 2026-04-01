@@ -170,7 +170,10 @@ def _ensure_archive_loaded():
         _archive_index = {}
         for member in _archive_handle.getmembers():
             if member.isfile():
-                basename = os.path.basename(member.name).lower()
+                # Normalise: lowercase + collapse spaces/underscores to "_" so
+                # that "My_Image.png" (MediaWiki on-disk) matches a wikilink
+                # that refers to "My Image.png" (or vice-versa).
+                basename = os.path.basename(member.name).lower().replace(" ", "_")
                 # Keep the first occurrence (shallowest path) for each name.
                 if basename not in _archive_index:
                     _archive_index[basename] = member
@@ -426,21 +429,27 @@ def download_image(image_name):
         return safe_name
 
     # Try to extract from the local images archive before hitting the network.
-    if _ensure_archive_loaded():
-        member = _archive_index.get(safe_name.lower())
-        if member is not None:
-            try:
-                os.makedirs(os.path.dirname(filepath), exist_ok=True)
-                with _archive_handle.extractfile(member) as src, open(filepath, "wb") as dst:
-                    dst.write(src.read())
-                logging.debug(f"📦 Extracted image from archive: {safe_name}")
-                return safe_name
-            except Exception as e:
-                logging.warning(f"⚠️ Failed to extract {safe_name} from archive: {e}")
-        else:
+    if IMAGES_ARCHIVE:
+        if not _ensure_archive_loaded():
+            return None
+        # Normalise the lookup key the same way the index was built: lowercase
+        # and replace spaces with underscores so that "My Image.png" matches
+        # the MediaWiki on-disk name "My_Image.png".
+        archive_key = os.path.basename(image_name).lower().replace(" ", "_")
+        member = _archive_index.get(archive_key)
+        if member is None:
             # When an archive is configured we do not fall back to network
             # downloads; the archive is treated as the authoritative image source.
             logging.warning(f"❌ Image not found in archive: {image_name}")
+            return None
+        try:
+            os.makedirs(os.path.dirname(filepath), exist_ok=True)
+            with _archive_handle.extractfile(member) as src, open(filepath, "wb") as dst:
+                dst.write(src.read())
+            logging.debug(f"📦 Extracted image from archive: {safe_name}")
+            return safe_name
+        except Exception as e:
+            logging.warning(f"⚠️ Failed to extract {safe_name} from archive: {e}")
             return None
 
     url = get_image_url(WIKI_DOMAIN, f"File:{image_name}")
