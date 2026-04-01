@@ -121,7 +121,7 @@ outline_output/
 | Index pages          | `_indexes/` with wikilinks      | `index.md` per collection folder     |
 | HTML in output       | Preserved                       | Stripped (sup/sub → LaTeX)            |
 | Footnotes            | Markdown footnotes              | Numbered references section           |
-| Tables               | Pandoc markdown tables          | Pipe tables (strict compatibility)    |
+| Tables               | Pandoc Markdown tables          | Pipe tables (strict compatibility)    |
 
 ## 👤 Author
 
