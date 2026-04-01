@@ -1,6 +1,7 @@
 import os
 import re
 import subprocess
+import tarfile
 import xml.etree.ElementTree as ET
 from html import unescape
 from collections import defaultdict
@@ -71,6 +72,10 @@ def parse_args():
                         help="Path to a file containing the Outline API key")
     parser.add_argument("--collection-id",
                         help="Outline collection ID to import documents into")
+    parser.add_argument("--images-archive",
+                        help="Path to a MediaWiki images backup archive (images.tar.gz). "
+                             "Images found in the archive are used instead of downloading "
+                             "them from the wiki.")
     return parser.parse_args()
 
 args = parse_args()
@@ -99,6 +104,7 @@ SKIP_REDIRECTS = args.skip_redirects
 OUTLINE_URL = args.outline_url
 OUTLINE_API_KEY = resolve_outline_api_key(args)
 COLLECTION_ID = args.collection_id
+IMAGES_ARCHIVE = args.images_archive
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -122,8 +128,14 @@ redirect_output_paths = {}
 # All reserved relative output paths, used to avoid filename collisions.
 planned_output_paths = set()
 
+# Lazy-loaded images archive state. Populated on first use of download_image()
+# when IMAGES_ARCHIVE is set.
+_archive_handle = None   # open tarfile.TarFile object
+_archive_index = None    # dict: lowercase basename -> TarInfo member
+
 
 def reset_runtime_state():
+    global _archive_handle, _archive_index
     tag_to_pages.clear()
     filename_counts.clear()
     category_to_pages.clear()
@@ -133,6 +145,41 @@ def reset_runtime_state():
     redirect_targets.clear()
     redirect_output_paths.clear()
     planned_output_paths.clear()
+    if _archive_handle is not None:
+        try:
+            _archive_handle.close()
+        except Exception:
+            pass
+    _archive_handle = None
+    _archive_index = None
+
+
+def _ensure_archive_loaded():
+    """Open IMAGES_ARCHIVE and build a lowercase-basename index on first call.
+
+    Returns True if the archive is available and the index is ready, False
+    otherwise.  Subsequent calls are cheap (index already built).
+    """
+    global _archive_handle, _archive_index
+    if not IMAGES_ARCHIVE:
+        return False
+    if _archive_index is not None:
+        return True
+    try:
+        _archive_handle = tarfile.open(IMAGES_ARCHIVE, "r:*")
+        _archive_index = {}
+        for member in _archive_handle.getmembers():
+            if member.isfile():
+                basename = os.path.basename(member.name).lower()
+                # Keep the first occurrence (shallowest path) for each name.
+                if basename not in _archive_index:
+                    _archive_index[basename] = member
+        logging.info(f"📦 Loaded images archive: {IMAGES_ARCHIVE} ({len(_archive_index)} images indexed)")
+        return True
+    except Exception as e:
+        logging.error(f"❌ Failed to open images archive {IMAGES_ARCHIVE}: {e}")
+        _archive_index = {}  # Mark as attempted so we don't retry.
+        return False
 
 
 def normalize_page_title(title):
@@ -377,6 +424,24 @@ def download_image(image_name):
     if os.path.exists(filepath):
         logging.debug(f"🖼️ Skipping download (already exists): {safe_name}")
         return safe_name
+
+    # Try to extract from the local images archive before hitting the network.
+    if _ensure_archive_loaded():
+        member = _archive_index.get(safe_name.lower())
+        if member is not None:
+            try:
+                os.makedirs(os.path.dirname(filepath), exist_ok=True)
+                with _archive_handle.extractfile(member) as src, open(filepath, "wb") as dst:
+                    dst.write(src.read())
+                logging.debug(f"📦 Extracted image from archive: {safe_name}")
+                return safe_name
+            except Exception as e:
+                logging.warning(f"⚠️ Failed to extract {safe_name} from archive: {e}")
+        else:
+            # When an archive is configured we do not fall back to network
+            # downloads; the archive is treated as the authoritative image source.
+            logging.warning(f"❌ Image not found in archive: {image_name}")
+            return None
 
     url = get_image_url(WIKI_DOMAIN, f"File:{image_name}")
     if not url:
