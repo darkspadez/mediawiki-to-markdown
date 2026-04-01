@@ -26,6 +26,7 @@ from convert import (
     convert_pages,
     create_redirect_stubs,
     create_tag_indexes,
+    outline_upload_documents,
     validate_local_links,
 )
 
@@ -351,3 +352,104 @@ def test_plan_pages_handles_filename_collisions_for_links(monkeypatch):
 
     assert first == "[Alpha/Beta](./Alpha_Beta.md)"
     assert second == "[Alpha:Beta](./Alpha_Beta_1.md)"
+
+
+def test_clean_wikilink_outline_slugifies_anchor(monkeypatch):
+    convert.reset_runtime_state()
+    monkeypatch.setitem(convert.page_output_paths, "One Ring", "items/One_Ring.md")
+
+    result = clean_wikilink(
+        "One_Ring#The_One_Ring?|The One Ring",
+        output_format="outline",
+        current_page_path="characters/Aragorn.md",
+    )
+
+    assert result == "[The One Ring](../items/One_Ring.md#the-one-ring)"
+
+
+def test_extract_source_metadata_redacts_anonymous_ip():
+    revision = ET.fromstring(f"""
+    <revision xmlns="{convert.NS}">
+      <timestamp>2024-01-02T03:04:05Z</timestamp>
+      <contributor><ip>203.0.113.4</ip></contributor>
+    </revision>
+    """)
+
+    metadata = convert.extract_source_metadata("Aragorn", revision)
+
+    assert metadata["source_last_editor"] == "Anonymous"
+
+
+def test_resolve_outline_api_key_prefers_file_then_env(tmp_path, monkeypatch):
+    key_file = tmp_path / "outline-api-key.txt"
+    key_file.write_text("file-secret\n", encoding="utf-8")
+    monkeypatch.setenv("OUTLINE_API_KEY", "env-secret")
+
+    file_value = convert.resolve_outline_api_key(
+        type("Args", (), {"outline_api_key_file": str(key_file)})()
+    )
+    env_value = convert.resolve_outline_api_key(
+        type("Args", (), {"outline_api_key_file": None})()
+    )
+
+    assert file_value == "file-secret"
+    assert env_value == "env-secret"
+
+
+def test_outline_upload_documents_rewrites_nested_image_links_and_updates_existing_doc(
+    tmp_path, monkeypatch
+):
+    convert.reset_runtime_state()
+    monkeypatch.setattr(convert, "OUTPUT_DIR", str(tmp_path))
+    monkeypatch.setattr(convert, "OUTLINE_URL", "https://wiki.example.com")
+    monkeypatch.setattr(convert, "OUTLINE_API_KEY", "secret")
+    monkeypatch.setattr(convert, "COLLECTION_ID", None)
+
+    images_dir = tmp_path / "images"
+    images_dir.mkdir()
+    (images_dir / "photo.jpg").write_bytes(b"image")
+
+    characters_dir = tmp_path / "characters"
+    characters_dir.mkdir()
+    (characters_dir / "Aragorn.md").write_text(
+        "# Aragorn\n\n![photo.jpg](../images/photo.jpg)\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        convert,
+        "outline_upload_image",
+        lambda filepath: f"https://cdn.example.com/{os.path.basename(filepath)}",
+    )
+    monkeypatch.setattr(
+        convert,
+        "outline_get_or_create_collection",
+        lambda name: "default-col" if name == "Imported Wiki" else "characters-col",
+    )
+
+    calls = []
+
+    def fake_outline_api_request(endpoint, data=None, files=None):
+        calls.append((endpoint, data, files))
+        if endpoint == "documents.search":
+            return {
+                "data": [
+                    {"id": "doc-1", "title": "Aragorn", "collectionId": "characters-col"}
+                ]
+            }
+        if endpoint == "documents.update":
+            return {"data": {"id": "doc-1"}}
+        if endpoint == "documents.create":
+            pytest.fail("documents.create should not be called when an existing document is found")
+        return None
+
+    monkeypatch.setattr(convert, "outline_api_request", fake_outline_api_request)
+
+    outline_upload_documents()
+
+    search_calls = [call for call in calls if call[0] == "documents.search"]
+    update_calls = [call for call in calls if call[0] == "documents.update"]
+
+    assert len(search_calls) == 1
+    assert len(update_calls) == 1
+    assert update_calls[0][1]["text"].count("https://cdn.example.com/photo.jpg") == 1

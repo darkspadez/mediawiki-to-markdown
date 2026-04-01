@@ -67,8 +67,8 @@ def parse_args():
     # Outline API options
     parser.add_argument("--outline-url",
                         help="Outline instance URL (e.g. https://wiki.example.com)")
-    parser.add_argument("--outline-api-key",
-                        help="Outline API key for uploading documents")
+    parser.add_argument("--outline-api-key-file",
+                        help="Path to a file containing the Outline API key")
     parser.add_argument("--collection-id",
                         help="Outline collection ID to import documents into")
     return parser.parse_args()
@@ -81,12 +81,23 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)]
 )
 
+
+def resolve_outline_api_key(parsed_args):
+    if parsed_args.outline_api_key_file:
+        try:
+            with open(parsed_args.outline_api_key_file, "r", encoding="utf-8") as f:
+                return f.read().strip()
+        except OSError as e:
+            logging.error(f"❌ Failed to read Outline API key file: {e}")
+            return None
+    return os.environ.get("OUTLINE_API_KEY")
+
 INPUT_XML = args.input_xml
 OUTPUT_FORMAT = args.output_format
 OUTPUT_DIR = args.output_dir or ("outline_output" if OUTPUT_FORMAT == "outline" else "obsidian_vault")
 SKIP_REDIRECTS = args.skip_redirects
 OUTLINE_URL = args.outline_url
-OUTLINE_API_KEY = args.outline_api_key
+OUTLINE_API_KEY = resolve_outline_api_key(args)
 COLLECTION_ID = args.collection_id
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -186,7 +197,9 @@ def resolve_page_link(target, current_page_path=None, output_format=None):
         link = format_relative_link(fallback_name)
 
     if anchor:
-        return f"{link}#{url_quote(anchor)}"
+        normalized_anchor = slugify_heading_fragment(anchor)
+        if normalized_anchor:
+            return f"{link}#{url_quote(normalized_anchor)}"
     return link
 
 
@@ -227,7 +240,7 @@ def extract_source_metadata(title, revision):
         if username is not None and username.text:
             metadata["source_last_editor"] = username.text.strip()
         elif ip_addr is not None and ip_addr.text:
-            metadata["source_last_editor"] = ip_addr.text.strip()
+            metadata["source_last_editor"] = "Anonymous"
 
     source_url = build_source_url(title)
     if source_url:
@@ -258,6 +271,14 @@ def normalize_tag(tag):
 def display_title(title):
     """Convert to human-readable title with spaces"""
     return title.replace('_', ' ')
+
+
+def slugify_heading_fragment(fragment):
+    fragment = url_unquote(unescape(fragment or ""))
+    fragment = fragment.replace('_', ' ')
+    fragment = re.sub(r'[^\w\s-]', '', fragment, flags=re.UNICODE).strip().lower()
+    return re.sub(r'[-\s]+', '-', fragment)
+
 
 def clean_wikilink(link_content, output_format=None, current_page_path=None):
     """Centralized wikilink cleaning.
@@ -811,7 +832,7 @@ def convert_pages(tree):
                 pbar.update(1)
                 continue
 
-            header_str, wikitext, tags = clean_and_convert_text_with_metadata(
+            header_str, wikitext, _tags = clean_and_convert_text_with_metadata(
                 raw_text,
                 title,
                 output_format=OUTPUT_FORMAT,
@@ -1057,6 +1078,32 @@ def outline_upload_documents():
         logging.error("❌ Could not get or create Outline collection")
         return
 
+    def _rewrite_uploaded_image(match):
+        original_target = match.group(1)
+        target = url_unquote(original_target.split("#", 1)[0])
+        if re.match(r'^[a-z]+://', target) or target.startswith("data:"):
+            return match.group(0)
+        image_name = os.path.basename(target)
+        image_url = image_url_map.get(image_name)
+        if not image_url:
+            return match.group(0)
+        return match.group(0).replace(original_target, image_url)
+
+    def _find_existing_outline_document(title, collection_id):
+        result = outline_api_request("documents.search", {
+            "query": title,
+            "collectionId": collection_id,
+        })
+        if not result or not result.get("data"):
+            return None
+
+        for doc in result["data"]:
+            doc_title = doc.get("title", "").strip().lower()
+            doc_collection_id = doc.get("collectionId")
+            if doc_title == title.strip().lower() and doc_collection_id in (None, collection_id):
+                return doc.get("id")
+        return None
+
     # Walk through output directory and upload documents
     uploaded = 0
     for root, _dirs, files in os.walk(OUTPUT_DIR):
@@ -1068,13 +1115,11 @@ def outline_upload_documents():
                 content = f.read()
 
             # Rewrite image URLs to use Outline attachment URLs
-            for img_name, img_url in image_url_map.items():
-                content = content.replace(
-                    f"./{IMAGE_DIR}/{url_quote(img_name)}", img_url
-                )
-                content = content.replace(
-                    f"./{IMAGE_DIR}/{img_name}", img_url
-                )
+            content = re.sub(
+                r'!\[[^\]]*\]\(([^)]+)\)',
+                _rewrite_uploaded_image,
+                content,
+            )
 
             # Extract title from first H1 heading
             title_match = re.search(r'^# (.+)$', content, re.MULTILINE)
@@ -1091,12 +1136,22 @@ def outline_upload_documents():
             else:
                 col_id = default_collection
 
-            result = outline_api_request("documents.create", {
-                "title": title,
-                "text": content,
-                "collectionId": col_id,
-                "publish": True,
-            })
+            existing_doc_id = _find_existing_outline_document(title, col_id)
+            if existing_doc_id:
+                result = outline_api_request("documents.update", {
+                    "id": existing_doc_id,
+                    "title": title,
+                    "text": content,
+                    "collectionId": col_id,
+                    "publish": True,
+                })
+            else:
+                result = outline_api_request("documents.create", {
+                    "title": title,
+                    "text": content,
+                    "collectionId": col_id,
+                    "publish": True,
+                })
             if result and result.get("data"):
                 uploaded += 1
                 logging.debug(f"📤 Uploaded: {title}")

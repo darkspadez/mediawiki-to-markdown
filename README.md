@@ -60,9 +60,10 @@ python convert.py INPUT_XML [OUTPUT_DIR] --output-format outline [--skip-redirec
 ### Outline with API Upload
 
 ```bash
+export OUTLINE_API_KEY=YOUR_API_KEY
 python convert.py INPUT_XML --output-format outline \
   --outline-url https://wiki.example.com \
-  --outline-api-key YOUR_API_KEY \
+  [--outline-api-key-file /path/to/outline-api-key.txt] \
   [--collection-id COLLECTION_ID]
 ```
 
@@ -74,7 +75,8 @@ python convert.py INPUT_XML --output-format outline \
 | `--skip-redirects`   | Ignore redirect pages                                          |
 | `--verbose`          | Enable verbose logging (disables progress bar)                 |
 | `--outline-url`      | Outline instance URL for API upload                            |
-| `--outline-api-key`  | Outline API key for authentication                             |
+| `OUTLINE_API_KEY`    | Environment variable used for Outline API authentication        |
+| `--outline-api-key-file` | Optional file path containing the Outline API key          |
 | `--collection-id`    | Outline collection ID (creates "Imported Wiki" if omitted)     |
 
 ## 🗂️ Output Structure
