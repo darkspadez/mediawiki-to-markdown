@@ -453,3 +453,126 @@ def test_outline_upload_documents_rewrites_nested_image_links_and_updates_existi
     assert len(search_calls) == 1
     assert len(update_calls) == 1
     assert update_calls[0][1]["text"].count("https://cdn.example.com/photo.jpg") == 1
+
+
+# ---------------------------------------------------------------------------
+# images archive tests
+# ---------------------------------------------------------------------------
+
+def test_download_image_from_archive_extracts_file(tmp_path, monkeypatch):
+    """Images found in the archive are extracted to the output images dir."""
+    import io
+    import tarfile as _tarfile
+
+    image_data = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16  # minimal fake PNG bytes
+
+    # Build an in-memory tar.gz with a hashed path (as MediaWiki uses).
+    buf = io.BytesIO()
+    with _tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        info = _tarfile.TarInfo(name="images/a/ab/photo.png")
+        info.size = len(image_data)
+        tf.addfile(info, io.BytesIO(image_data))
+    archive_path = tmp_path / "images.tar.gz"
+    archive_path.write_bytes(buf.getvalue())
+
+    convert.reset_runtime_state()
+    monkeypatch.setattr(convert, "OUTPUT_DIR", str(tmp_path))
+    monkeypatch.setattr(convert, "IMAGES_ARCHIVE", str(archive_path))
+
+    result = convert.download_image("photo.png")
+
+    assert result == "photo.png"
+    extracted = tmp_path / "images" / "photo.png"
+    assert extracted.exists()
+    assert extracted.read_bytes() == image_data
+
+
+def test_download_image_archive_missing_image_returns_none(tmp_path, monkeypatch):
+    """When the archive does not contain the requested image, return None."""
+    import io
+    import tarfile as _tarfile
+
+    dummy_data = b"\x00" * 4
+    buf = io.BytesIO()
+    with _tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        info = _tarfile.TarInfo(name="images/a/ab/other.png")
+        info.size = len(dummy_data)
+        tf.addfile(info, io.BytesIO(dummy_data))
+    archive_path = tmp_path / "images.tar.gz"
+    archive_path.write_bytes(buf.getvalue())
+
+    convert.reset_runtime_state()
+    monkeypatch.setattr(convert, "OUTPUT_DIR", str(tmp_path))
+    monkeypatch.setattr(convert, "IMAGES_ARCHIVE", str(archive_path))
+
+    result = convert.download_image("missing.png")
+
+    assert result is None
+    assert not (tmp_path / "images" / "missing.png").exists()
+
+
+def test_download_image_skips_archive_when_not_set(tmp_path, monkeypatch):
+    """When no archive is configured, the code falls back to network download."""
+    convert.reset_runtime_state()
+    monkeypatch.setattr(convert, "OUTPUT_DIR", str(tmp_path))
+    monkeypatch.setattr(convert, "IMAGES_ARCHIVE", None)
+
+    network_called = []
+
+    def fake_get_image_url(domain, filename):
+        network_called.append(filename)
+        return None  # Simulate no URL found.
+
+    monkeypatch.setattr(convert, "get_image_url", fake_get_image_url)
+    monkeypatch.setattr(convert, "WIKI_DOMAIN", "example.com")
+
+    result = convert.download_image("photo.png")
+
+    assert result is None
+    assert network_called  # Confirm network path was attempted.
+
+
+def test_download_image_archive_space_underscore_normalization(tmp_path, monkeypatch):
+    """MediaWiki stores 'My Image.png' as 'My_Image.png'; the archive lookup must match."""
+    import io
+    import tarfile as _tarfile
+
+    image_data = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16  # minimal fake PNG bytes
+
+    buf = io.BytesIO()
+    with _tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        info = _tarfile.TarInfo(name="images/a/ab/My_Image.png")
+        info.size = len(image_data)
+        tf.addfile(info, io.BytesIO(image_data))
+    archive_path = tmp_path / "images.tar.gz"
+    archive_path.write_bytes(buf.getvalue())
+
+    convert.reset_runtime_state()
+    monkeypatch.setattr(convert, "OUTPUT_DIR", str(tmp_path))
+    monkeypatch.setattr(convert, "IMAGES_ARCHIVE", str(archive_path))
+
+    # The wikilink title uses a space; MediaWiki stored the file with an underscore.
+    result = convert.download_image("My Image.png")
+
+    assert result == "My Image.png"
+    extracted = tmp_path / "images" / "My Image.png"
+    assert extracted.exists()
+    assert extracted.read_bytes() == image_data
+
+
+def test_download_image_corrupt_archive_returns_none_no_network_fallback(tmp_path, monkeypatch):
+    """A corrupt archive must return None and must NOT fall back to network downloads."""
+    archive_path = tmp_path / "bad.tar.gz"
+    archive_path.write_bytes(b"not a tar file at all")
+
+    convert.reset_runtime_state()
+    monkeypatch.setattr(convert, "OUTPUT_DIR", str(tmp_path))
+    monkeypatch.setattr(convert, "IMAGES_ARCHIVE", str(archive_path))
+
+    network_called = []
+    monkeypatch.setattr(convert, "get_image_url", lambda *a: network_called.append(a) or None)
+
+    result = convert.download_image("photo.png")
+
+    assert result is None
+    assert not network_called  # Archive is authoritative; network must not be tried.
